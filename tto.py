@@ -1,36 +1,29 @@
-"""
-用纯Python实现GPT训练和推理的最原子化方式
-在此基础上实现 Test Time Optimization (TTO)
-
-TTO 核心思想：
-- 推理时只优化部分参数（而非全部），更轻量高效
-- 常见策略：只优化 output head 或 normalization 参数
-- 比完整 TTT 更快，但仍能获得适应能力
-
-@karpathy + TTO extension
-"""
-
 import math
 import os
 import random
 
+# 设定随机种子，确保实验可重复
 random.seed(42)
 
-# 数据准备
+# ========== 1. 数据准备 (Karpathy makemore 风格) ==========
 if not os.path.exists('input.txt'):
     import urllib.request
     names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
     urllib.request.urlretrieve(names_url, 'input.txt')
+
 docs = [line.strip() for line in open('input.txt') if line.strip()]
 random.shuffle(docs)
-print(f"num docs: {len(docs)}")
 
 uchars = sorted(set(''.join(docs)))
-BOS = len(uchars)
+BOS = len(uchars)  # 序列起始/结束符
 vocab_size = len(uchars) + 1
-print(f"vocab size: {vocab_size}")
+char_to_it = {ch: i for i, ch in enumerate(uchars)}
+it_to_char = {i: ch for i, ch in enumerate(uchars)}
+it_to_char[BOS] = '.'
 
+# ========== 2. 自动微分系统 (Micrograd) ==========
 class Value:
+    """ 最原子化的自动微分引擎 """
     __slots__ = ('data', 'grad', '_children', '_local_grads')
 
     def __init__(self, data, children=(), local_grads=()):
@@ -43,15 +36,21 @@ class Value:
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data + other.data, (self, other), (1, 1))
 
+    def __radd__(self, other): # 支持 sum([Value, Value], 0) 这种操作
+        return self + other
+
     def __mul__(self, other):
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data * other.data, (self, other), (other.data, self.data))
+
+    def __rmul__(self, other):
+        return self * other
 
     def __pow__(self, other):
         return Value(self.data**other, (self,), (other * self.data**(other-1),))
 
     def log(self):
-        return Value(math.log(self.data), (self,), (1/self.data,))
+        return Value(math.log(self.data + 1e-10), (self,), (1/(self.data + 1e-10),))
 
     def exp(self):
         return Value(math.exp(self.data), (self,), (math.exp(self.data),))
@@ -59,261 +58,186 @@ class Value:
     def relu(self):
         return Value(max(0, self.data), (self,), (float(self.data > 0),))
 
-    def __neg__(self):
-        return self * -1
-
-    def __radd__(self, other):
-        return self + other
-
-    def __sub__(self, other):
-        return self + (-other)
-
-    def __rsub__(self, other):
-        return other + (-self)
-
-    def __rmul__(self, other):
-        return self * other
-
-    def __truediv__(self, other):
-        return self * other**-1
-
-    def __rtruediv__(self, other):
-        return other * self**-1
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-other)
+    def __rsub__(self, other): return other + (-self)
+    def __truediv__(self, other): return self * other**-1
 
     def backward(self):
-        topo = []
-        visited = set()
+        # 拓扑排序确保梯度传播顺序
+        topo, visited = [], set()
         def build_topo(v):
             if v not in visited:
                 visited.add(v)
-                for child in v._children:
-                    build_topo(child)
+                for child in v._children: build_topo(child)
                 topo.append(v)
         build_topo(self)
-
         self.grad = 1
         for v in reversed(topo):
             for child, local_grad in zip(v._children, v._local_grads):
                 child.grad += local_grad * v.grad
 
+# ========== 3. 模型配置与参数初始化 ==========
 n_layer = 1
 n_embd = 16
-block_size = 16
+block_size = 16 # 名字通常比较短
 n_head = 4
 head_dim = n_embd // n_head
-matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 
+def init_matrix(nout, nin, std=0.02):
+    return [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
+
+# 定义静态 Backbone 参数
 state_dict = {
-    'wte': matrix(vocab_size, n_embd),
-    'wpe': matrix(block_size, n_embd),
-    'lm_head': matrix(vocab_size, n_embd)
+    'wte': init_matrix(vocab_size, n_embd),
+    'wpe': init_matrix(block_size, n_embd),
+    'lm_head': init_matrix(vocab_size, n_embd)
 }
 
 for i in range(n_layer):
-    state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+    state_dict[f'layer{i}.attn_wq'] = init_matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wk'] = init_matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wv'] = init_matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.attn_wo'] = init_matrix(n_embd, n_embd)
+    state_dict[f'layer{i}.mlp_fc1'] = init_matrix(4 * n_embd, n_embd)
+    state_dict[f'layer{i}.mlp_fc2'] = init_matrix(n_embd, 4 * n_embd)
 
+# 展平所有参数以便优化
 params = [p for mat in state_dict.values() for row in mat for p in row]
-print(f"num params: {len(params)}")
 
-# TTO: 只优化 output head (lm_head) 参数
-lm_head_params = [p for row in state_dict['lm_head'] for p in row]
-print(f"TTO optimizable params (lm_head only): {len(lm_head_params)}")
+# TTO 目标参数：只优化输出头 (lm_head)
+tto_params = [p for row in state_dict['lm_head'] for p in row]
+
+# ========== 4. 核心算子 (算子化实现) ==========
 
 def linear(x, w):
-    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+    return [sum((wi * xi for wi, xi in zip(wo, x)), Value(0)) for wo in w]
 
 def softmax(logits):
-    max_val = max(val.data for val in logits)
-    exps = [(val - max_val).exp() for val in logits]
-    total = sum(exps)
+    mv = max(val.data for val in logits)
+    exps = [(val - mv).exp() for val in logits]
+    total = sum(exps, Value(0))
     return [e / total for e in exps]
 
 def rmsnorm(x):
-    ms = sum(xi * xi for xi in x) / len(x)
+    ms = sum((xi * xi for xi in x), Value(0)) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
 
-def gpt(token_id, pos_id, keys, values):
-    tok_emb = state_dict['wte'][token_id]
-    pos_emb = state_dict['wpe'][pos_id]
-    x = [t + p for t, p in zip(tok_emb, pos_emb)]
-    x = rmsnorm(x)
+def gpt_forward(token_id, pos_id, keys, values):
+    """ GPT 单步前向传播（带 KV Cache 接口） """
+    x = [t + p for t, p in zip(state_dict['wte'][token_id], state_dict['wpe'][pos_id])]
 
     for li in range(n_layer):
-        x_residual = x
+        # Attention 模块
+        x_res = x
         x = rmsnorm(x)
         q = linear(x, state_dict[f'layer{li}.attn_wq'])
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
-        keys[li].append(k)
-        values[li].append(v)
+        keys[li].append(k); values[li].append(v)
+
+        # 多头注意力拼接
         x_attn = []
         for h in range(n_head):
             hs = h * head_dim
             q_h = q[hs:hs+head_dim]
             k_h = [ki[hs:hs+head_dim] for ki in keys[li]]
             v_h = [vi[hs:hs+head_dim] for vi in values[li]]
-            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
-            attn_weights = softmax(attn_logits)
-            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
-            x_attn.extend(head_out)
 
-        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
-        x = [a + b for a, b in zip(x, x_residual)]
-        x_residual = x
+            # Dot-product attention
+            score = [sum((qj * kj for qj, kj in zip(q_h, kh)), Value(0)) / (head_dim**0.5) for kh in k_h]
+            weights = softmax(score)
+            context = [sum((weights[t] * v_h[t][j] for t in range(len(v_h))), Value(0)) for j in range(head_dim)]
+            x_attn.extend(context)
+
+        x = [a + b for a, b in zip(linear(x_attn, state_dict[f'layer{li}.attn_wo']), x_res)]
+
+        # MLP 模块
+        x_res = x
         x = rmsnorm(x)
-        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
-        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
-        x = [a + b for a, b in zip(x, x_residual)]
+        x = [xi.relu() for xi in linear(x, state_dict[f'layer{li}.mlp_fc1'])]
+        x = [a + b for a, b in zip(linear(x, state_dict[f'layer{li}.mlp_fc2']), x_res)]
 
-    logits = linear(x, state_dict['lm_head'])
-    return logits
+    return linear(x, state_dict['lm_head'])
 
-# Adam 优化器（用于预训练）
-learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-m = [0.0] * len(params)
-v = [0.0] * len(params)
+# ========== 5. 训练与 TTO 核心逻辑 ==========
 
-# Phase 1: 预训练
-num_steps = 1000
-print("\n=== Phase 1: Pre-training ===")
-for step in range(num_steps):
+# Adam 优化器状态
+m = [0.0] * len(params); v = [0.0] * len(params)
+
+print("=== Phase 1: Pre-training (Backbone) ===")
+for step in range(201):
     doc = docs[step % len(docs)]
-    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
+    tokens = [BOS] + [char_to_it[c] for c in doc] + [BOS]
     n = min(block_size, len(tokens) - 1)
 
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-    losses = []
-    for pos_id in range(n):
-        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-        logits = gpt(token_id, pos_id, keys, values)
+    total_loss = Value(0)
+    for t in range(n):
+        logits = gpt_forward(tokens[t], t, keys, values)
         probs = softmax(logits)
-        loss_t = -probs[target_id].log()
-        losses.append(loss_t)
+        total_loss = total_loss + (-probs[tokens[t+1]].log())
 
-    total = Value(0)
-    for loss_t in losses:
-        total = total + loss_t
-    loss = (Value(1) / Value(n)) * total
-
+    loss = total_loss / n
     loss.backward()
 
-    lr_t = learning_rate * (1 - step / num_steps)
+    # 全量参数 Adam 更新
     for i, p in enumerate(params):
-        m[i] = beta1 * m[i] + (1 - beta1) * p.grad
-        v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
-        m_hat = m[i] / (1 - beta1 ** (step + 1))
-        v_hat = v[i] / (1 - beta2 ** (step + 1))
-        p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
+        m[i] = 0.9 * m[i] + 0.1 * p.grad
+        v[i] = 0.999 * v[i] + 0.001 * (p.grad**2)
+        p.data -= 0.01 * m[i] / (math.sqrt(v[i]) + 1e-8)
         p.grad = 0
+    if step % 50 == 0: print(f"Step {step} | Loss: {loss.data:.4f}")
 
-    print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}", end='\r')
+# ========== 6. Test Time Optimization (TTO) 推理 ==========
 
-print("\n\n=== Phase 2: Test Time Optimization (TTO) Inference ===")
+def tto_generate(prefix_str, tto_steps=1):
+    # 1. 备份 lm_head 初始参数 (快照)
+    snapshot = [p.data for p in tto_params]
+    tto_m = [0.0] * len(tto_params) # TTO 局部动量
 
-# TTO 配置
-tto_lr = 0.01
-tto_momentum = 0.9
-temperature = 0.5
+    tokens = [BOS] + [char_to_it[c] for c in prefix_str]
 
-# TTO 只为 lm_head 参数维护优化状态
-tto_m = [0.0] * len(lm_head_params)
+    # 2. TTO 适应阶段：根据前缀微调输出头
+    if len(tokens) > 1:
+        for _ in range(tto_steps):
+            keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+            total_loss = Value(0)
+            for t in range(len(tokens)-1):
+                logits = gpt_forward(tokens[t], t, keys, values)
+                probs = softmax(logits)
+                total_loss = total_loss + (-probs[tokens[t+1]].log())
 
-def save_lm_head():
-    return [p.data for p in lm_head_params]
+            (total_loss / (len(tokens)-1)).backward()
 
-def restore_lm_head(snapshot):
-    for p, val in zip(lm_head_params, snapshot):
-        p.data = val
+            # 只更新 tto_params (lm_head)
+            for i, p in enumerate(tto_params):
+                tto_m[i] = 0.9 * tto_m[i] + p.grad
+                p.data -= 0.05 * tto_m[i] # 较大的 TTO 学习率
 
-def tto_adapt_step(tokens):
-    """TTO: 只更新 lm_head 参数"""
-    n = min(block_size, len(tokens) - 1)
+            # 清理所有梯度
+            for p in params: p.grad = 0
+
+    # 3. 生成阶段
+    res = prefix_str
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-    losses = []
+    # 预填充 KV Cache
+    for t in range(len(tokens)-1): gpt_forward(tokens[t], t, keys, values)
 
-    for pos_id in range(n):
-        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-        logits = gpt(token_id, pos_id, keys, values)
-        probs = softmax(logits)
-        loss_t = -probs[target_id].log()
-        losses.append(loss_t)
+    curr = tokens[-1]
+    for i in range(block_size - len(tokens)):
+        logits = gpt_forward(curr, len(tokens)-1 + i, keys, values)
+        probs = softmax([l / 0.7 for l in logits]) # 带温度采样
+        next_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+        if next_id == BOS: break
+        res += it_to_char[next_id]
+        curr = next_id
 
-    total = Value(0)
-    for loss_t in losses:
-        total = total + loss_t
-    loss = (Value(1) / Value(n)) * total
+    # 4. 恢复快照：保证 TTO 只针对当前推理，不污染全局模型
+    for p, val in zip(tto_params, snapshot): p.data = val
+    return res
 
-    loss.backward()
-
-    # 只更新 lm_head 参数（使用简单 SGD + momentum）
-    for i, p in enumerate(lm_head_params):
-        tto_m[i] = tto_momentum * tto_m[i] + p.grad
-        p.data -= tto_lr * tto_m[i]
-        p.grad = 0
-
-    # 清零其他参数的梯度（不更新）
-    for p in params:
-        if p not in lm_head_params:
-            p.grad = 0
-
-    return loss.data
-
-def tto_generate(context_tokens):
-    """TTO 生成：先适应，再生成"""
-    snapshot = save_lm_head()
-
-    # TTO 适应
-    if len(context_tokens) > 1:
-        tto_adapt_step(context_tokens)
-
-    # 生成
-    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-
-    for pos_id, token_id in enumerate(context_tokens[:-1]):
-        _ = gpt(token_id, pos_id, keys, values)
-
-    token_id = context_tokens[-1]
-    sample = []
-    pos_id = len(context_tokens) - 1
-
-    for _ in range(block_size - pos_id):
-        logits = gpt(token_id, pos_id, keys, values)
-        probs = softmax([l / temperature for l in logits])
-        token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
-        if token_id == BOS:
-            break
-        sample.append(uchars[token_id])
-        pos_id += 1
-
-    # 恢复参数
-    restore_lm_head(snapshot)
-
-    return ''.join(sample)
-
-print(f"TTO config: lr={tto_lr}, momentum={tto_momentum}")
-print(f"Optimizing only {len(lm_head_params)}/{len(params)} params ({100*len(lm_head_params)/len(params):.1f}%)\n")
-
-for sample_idx in range(20):
-    context_doc = docs[(num_steps + sample_idx) % len(docs)]
-
-    if sample_idx < 10:
-        sample = tto_generate([BOS, BOS])
-        print(f"sample {sample_idx+1:2d} (TTO from BOS): {sample}")
-    else:
-        half = len(context_doc) // 2
-        prefix = context_doc[:half]
-        prefix_tokens = [BOS] + [uchars.index(ch) for ch in prefix]
-        sample = tto_generate(prefix_tokens)
-        print(f"sample {sample_idx+1:2d} (TTO from '{prefix}...'): {sample}")
-
-print("\n=== TTO Complete ===")
-print(f"Total params: {len(params)}")
-print(f"TTO params: {len(lm_head_params)} (lm_head only)")
-print(f"Efficiency gain: {len(params)/len(lm_head_params):.1f}x faster than full TTT")
+print("\n=== Phase 2: TTO Inference (Adapting only LM Head) ===")
+for p in ["ma", "lu", "ka"]:
+    print(f"Prefix '{p}' -> TTO Output: {tto_generate(p)}")
