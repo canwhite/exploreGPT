@@ -2,7 +2,29 @@ import math
 import os
 import random
 
-# ========== 1. 核心微分引擎 (Micrograd) ==========
+random.seed(42)
+
+# ========== 1. 数据获取（参考 micro.py）==========
+if not os.path.exists('input.txt'):
+    import urllib.request
+    names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
+    urllib.request.urlretrieve(names_url, 'input.txt')
+
+docs = [line.strip() for line in open('input.txt') if line.strip()]
+random.shuffle(docs)
+print(f"num docs: {len(docs)}")
+
+# ========== 2. 分词器构建 ==========
+uchars = sorted(set(''.join(docs)))
+BOS = len(uchars)
+vocab_size = len(uchars) + 1
+char_to_it = {ch: i for i, ch in enumerate(uchars)}
+char_to_it['.'] = BOS
+it_to_char = {i: ch for i, ch in enumerate(uchars)}
+it_to_char[BOS] = '.'
+print(f"vocab size: {vocab_size}")
+
+# ========== 3. 核心微分引擎 (Micrograd) ==========
 class Value:
     __slots__ = ('data', 'grad', '_children', '_local_grads')
     def __init__(self, data, children=(), local_grads=()):
@@ -40,7 +62,7 @@ class Value:
             for child, local_grad in zip(v._children, v._local_grads):
                 child.grad += local_grad * v.grad
 
-# ========== 2. 算子定义 ==========
+# ========== 4. 算子定义 ==========
 def rmsnorm(x):
     ms = sum((xi * xi for xi in x), Value(0)) / len(x)
     return [xi * ((ms + 1e-5) ** -0.5) for xi in x]
@@ -54,10 +76,9 @@ def softmax(logits):
     total = sum(exps, Value(0))
     return [e / total for e in exps]
 
-# ========== 3. Hybrid 层 (TTT & Attention) ==========
+# ========== 5. Hybrid 层 (TTT & Attention) ==========
 def ttt_step(x, W_hidden, ttt_lr=0.2):
-    y = linear(x, W_hidden) # 这里的线性变换就是 RNN 式的状态提取
-    # 自监督更新：让 W 学会重建 x
+    y = linear(x, W_hidden)
     x_hat = linear(x, W_hidden)
     loss = sum(((xh - xi)**2 for xh, xi in zip(x_hat, x)), Value(0))
     loss.backward()
@@ -73,25 +94,25 @@ def attention_step(q, k_cache, v_cache):
     weights = softmax(scores)
     return [sum((weights[t] * v_cache[t][j] for t in range(len(v_cache))), Value(0)) for j in range(d_k)]
 
-# ========== 4. 模型参数初始化 ==========
-random.seed(42)
+# ========== 6. 模型参数初始化 ==========
 n_embd = 12
-vocab_size = 27 # a-z + BOS
-char_to_it = {ch: i for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz")}
-it_to_char = {i: ch for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz")}
-char_to_it['.'] = 26; it_to_char[26] = '.'
-BOS = 26
+block_size = 16  # 最大上下文长度
+matrix = lambda nout, nin, std=0.1: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 
 state_dict = {
-    'wte': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(vocab_size)],
-    'lm_head': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(vocab_size)],
-    'attn_q': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)],
-    'attn_k': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)],
-    'attn_v': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)],
-    'mlp': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)]
+    'wte': matrix(vocab_size, n_embd),
+    'lm_head': matrix(vocab_size, n_embd),
+    'attn_q': matrix(n_embd, n_embd),
+    'attn_k': matrix(n_embd, n_embd),
+    'attn_v': matrix(n_embd, n_embd),
+    'mlp': matrix(n_embd, n_embd)
 }
 
-# ========== 5. 混合前向传播逻辑 ==========
+# 展平所有参数
+params = [p for mat in state_dict.values() for row in mat for p in row]
+print(f"num params: {len(params)}")
+
+# ========== 7. 混合前向传播逻辑 ==========
 def forward(token_id, ttt_states, kv_cache):
     x = state_dict['wte'][token_id]
 
@@ -111,50 +132,66 @@ def forward(token_id, ttt_states, kv_cache):
 
     return linear(x, state_dict['lm_head'])
 
-# ========== 6. 极速预训练 (过拟合几个单词以验证逻辑) ==========
-dataset = ["zack", "jack", "mary"]
-print("=== 开始 Hybrid 预训练 (微型过拟合测试) ===")
-for step in range(151):
-    word = random.choice(dataset)
-    tokens = [char_to_it[c] for c in word] + [BOS]
+# ========== 8. 训练循环（Adam优化器）==========
+learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
+m = [0.0] * len(params)
+v = [0.0] * len(params)
+num_steps = 500
+
+print("=== 开始 Hybrid 预训练 ===")
+for step in range(num_steps):
+    # 取一个文档，分词
+    doc = docs[step % len(docs)]
+    tokens = [BOS] + [char_to_it[ch] for ch in doc if ch in char_to_it] + [BOS]
+    n = min(block_size, len(tokens) - 1)
 
     ttt_states = [[[Value(1.0 if i==j else 0.0) for j in range(n_embd)] for i in range(n_embd)]]
     kv_cache = {'k': [], 'v': []}
 
-    loss = Value(0)
-    for t in range(len(tokens)-1):
+    losses = []
+    for t in range(n):
         logits = forward(tokens[t], ttt_states, kv_cache)
         probs = softmax(logits)
-        loss = loss + (-probs[tokens[t+1]].log())
+        loss_t = -probs[tokens[t+1]].log()
+        losses.append(loss_t)
 
-    loss = loss / (len(tokens)-1)
+    # 计算平均损失
+    total = Value(0)
+    for loss_t in losses:
+        total = total + loss_t
+    loss = total / n
+
     loss.backward()
 
-    for key in state_dict:
-        for row in state_dict[key]:
-            for p in row:
-                p.data -= 0.05 * p.grad
-                p.grad = 0
-    if step % 50 == 0: print(f"Step {step} | Loss: {loss.data:.4f}")
+    # Adam优化器更新
+    lr_t = learning_rate * (1 - step / num_steps)
+    for i, p in enumerate(params):
+        m[i] = beta1 * m[i] + (1 - beta1) * p.grad
+        v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
+        m_hat = m[i] / (1 - beta1 ** (step + 1))
+        v_hat = v[i] / (1 - beta2 ** (step + 1))
+        p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
+        p.grad = 0
 
-# ========== 7. 推理生成 ==========
-def generate(prefix):
+    if (step + 1) % 100 == 0:
+        print(f"Step {step+1:4d} / {num_steps} | Loss: {loss.data:.4f}")
+
+# ========== 9. 推理生成（批量）==========
+temperature = 0.5
+print(f"\n=== 推理生成 (temperature={temperature}) ===")
+
+for sample_idx in range(20):
     ttt_states = [[[Value(1.0 if i==j else 0.0) for j in range(n_embd)] for i in range(n_embd)]]
     kv_cache = {'k': [], 'v': []}
 
-    tokens = [char_to_it[c] for c in prefix]
-    for t in tokens[:-1]: forward(t, ttt_states, kv_cache)
+    token_id = BOS
+    sample = []
+    for _ in range(block_size):
+        logits = forward(token_id, ttt_states, kv_cache)
+        probs = softmax([l / temperature for l in logits])
+        token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+        if token_id == BOS:
+            break
+        sample.append(it_to_char.get(token_id, '?'))
 
-    res = prefix
-    curr = tokens[-1]
-    for _ in range(6):
-        logits = forward(curr, ttt_states, kv_cache)
-        next_id = max(range(vocab_size), key=lambda i: logits[i].data)
-        if next_id == BOS: break
-        res += it_to_char[next_id]
-        curr = next_id
-    return res
-
-print("\n=== 推理测试 ===")
-for p in ["za", "ma", "ja"]:
-    print(f"Prefix: '{p}' -> Result: '{generate(p)}'")
+    print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
