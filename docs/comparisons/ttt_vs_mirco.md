@@ -1,17 +1,17 @@
-# TTT.py vs Main.py 主要区别
+# TTT.py vs micro.py 主要区别
 
 ## 概述
 
-| 方面 | main.py (标准 GPT) | ttt.py (TTT) |
-|---|---|---|
-| **训练阶段** | 1 个阶段：预训练 | 2 个阶段：预训练 + TTT推理 |
-| **推理时参数** | 完全冻结 | 所有参数可更新 |
-| **推理开销** | O(1) 前向传播 | O(n × ttt_steps) 前向+反向+更新 |
-| **优化参数量** | 0 | 4192 (全部) |
+| 方面           | micro.py (标准 GPT) | ttt.py (TTT)                    |
+| -------------- | ------------------- | ------------------------------- |
+| **训练阶段**   | 1 个阶段：预训练    | 2 个阶段：预训练 + TTT推理      |
+| **推理时参数** | 完全冻结            | 所有参数可更新                  |
+| **推理开销**   | O(1) 前向传播       | O(n × ttt_steps) 前向+反向+更新 |
+| **优化参数量** | 0                   | 4192 (全部)                     |
 
 ## 核心代码差异
 
-### main.py: 标准推理
+### micro.py: 标准推理
 
 ```python
 for sample_idx in range(20):
@@ -62,22 +62,22 @@ def ttt_train_step(tokens):
 # 5. 新增：TTT 生成流程
 def ttt_generate_with_context(context_tokens, num_generate=1):
     param_snapshot = save_params()       # 保存所有参数
-    
+
     # TTT: 使用上下文训练
     for ttt_step in range(ttt_steps):
         ttt_loss = ttt_train_step(context_tokens)
-    
+
     # 使用 TTT 调整后的参数生成
     generated_samples = []
     # ... 生成逻辑
-    
+
     restore_params(param_snapshot)       # 恢复参数
     return generated_samples
 ```
 
 ## 流程对比
 
-### main.py 流程
+### micro.py 流程
 
 ```
 ┌─────────────┐     ┌─────────────┐
@@ -154,7 +154,7 @@ restore_params(param_snapshot)       # 恢复到原始状态
 
 ## 运行结果对比
 
-### main.py 输出
+### micro.py 输出
 
 ```
 num docs: 32033
@@ -190,16 +190,16 @@ Total params: 4192
 TTT added minimal overhead: 5 gradient steps per inference
 ```
 
-## TTT vs TTO vs Main 对比
+## TTT vs TTO vs micro 对比
 
-| 特性 | main.py | ttt.py | tto.py |
-|---|---|---|---|
-| 训练方式 | 预训练 | 预训练 + 推理时训练 | 预训练 + 推理时优化 |
-| 优化参数 | 0 | **4192 (全部)** | 432 (仅 lm_head) |
-| 优化器 | - | Adam | SGD + momentum |
-| 计算开销 | 低 | **最高** | 中等 |
-| 适应能力 | 无 | **最强** | 中等 |
-| 效率 | 最高 | 最低 | 9.7x 于 TTT |
+| 特性     | micro.py | ttt.py              | tto.py              |
+| -------- | -------- | ------------------- | ------------------- |
+| 训练方式 | 预训练   | 预训练 + 推理时训练 | 预训练 + 推理时优化 |
+| 优化参数 | 0        | **4192 (全部)**     | 432 (仅 lm_head)    |
+| 优化器   | -        | Adam                | SGD + momentum      |
+| 计算开销 | 低       | **最高**            | 中等                |
+| 适应能力 | 无       | **最强**            | 中等                |
+| 效率     | 最高     | 最低                | 9.7x 于 TTT         |
 
 ## 三种方法的权衡
 
@@ -212,17 +212,17 @@ TTT added minimal overhead: 5 gradient steps per inference
     │              ★ TTO (中等)
     │             /
     │            /
-    │       ★ Main (无)
+    │       ★ micro (无)
     │
     └──────────────────────────→ 计算效率
          低                    高
 ```
 
-| 场景 | 推荐方法 | 原因 |
-|---|---|---|
-| 通用生成任务 | main.py | 无需适应，效率最高 |
-| 需要强适应能力 | ttt.py | 全参数更新，适应最强 |
-| 平衡效率与适应 | tto.py | 9.7x 效率，仍有适应能力 |
+| 场景           | 推荐方法 | 原因                    |
+| -------------- | -------- | ----------------------- |
+| 通用生成任务   | micro.py | 无需适应，效率最高      |
+| 需要强适应能力 | ttt.py   | 全参数更新，适应最强    |
+| 平衡效率与适应 | tto.py   | 9.7x 效率，仍有适应能力 |
 
 ## 总结
 
