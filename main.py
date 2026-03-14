@@ -2,26 +2,7 @@ import math
 import os
 import random
 
-# 设定随机种子
-random.seed(42)
-
-# ========== 1. 数据准备 (names.txt) ==========
-if not os.path.exists('input.txt'):
-    import urllib.request
-    names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
-    urllib.request.urlretrieve(names_url, 'input.txt')
-
-docs = [line.strip() for line in open('input.txt') if line.strip()]
-random.shuffle(docs)
-
-uchars = sorted(set(''.join(docs)))
-BOS = len(uchars)
-vocab_size = len(uchars) + 1
-char_to_it = {ch: i for i, ch in enumerate(uchars)}
-it_to_char = {i: ch for i, ch in enumerate(uchars)}
-it_to_char[BOS] = '.'
-
-# ========== 2. 自动微分系统 (Micrograd) ==========
+# ========== 1. 核心微分引擎 (Micrograd) ==========
 class Value:
     __slots__ = ('data', 'grad', '_children', '_local_grads')
     def __init__(self, data, children=(), local_grads=()):
@@ -59,160 +40,121 @@ class Value:
             for child, local_grad in zip(v._children, v._local_grads):
                 child.grad += local_grad * v.grad
 
-# ========== 3. TTT-GPT 架构配置 ==========
-n_layer = 1
-n_embd = 16
-learning_rate = 0.01 # Backbone 学习率
-ttt_lr = 0.4         # TTT 动态更新步长
-
-def init_matrix(nout, nin):
-    return [[Value(random.gauss(0, 0.1)) for _ in range(nin)] for _ in range(nout)]
-
-# 静态主干网 (长期记忆/通用知识)
-state_dict = {
-    'wte': init_matrix(vocab_size, n_embd),
-    'lm_head': init_matrix(vocab_size, n_embd),
-}
-for i in range(n_layer):
-    state_dict[f'layer{i}.mlp'] = init_matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_out'] = init_matrix(n_embd, n_embd)
-
-# ========== 4. TTT-Layer 核心演算法 ==========
-
+# ========== 2. 算子定义 ==========
 def rmsnorm(x):
     ms = sum((xi * xi for xi in x), Value(0)) / len(x)
-    scale = (ms + 1e-5) ** -0.5
-    return [xi * scale for xi in x]
+    return [xi * ((ms + 1e-5) ** -0.5) for xi in x]
 
 def linear(x, w):
     return [sum((wi * xi for wi, xi in zip(wo, x)), Value(0)) for wo in w]
 
-def ttt_layer_step(x, W_hidden):
-    """
-    真正的 TTT 算子：
-    1. 线性变换作为推理 (RNN-like hidden state interaction)
-    2. 自监督重建任务更新 W_hidden (Gradient descent as state transition)
-    """
-    # --- Step 1: 推理 (获取当前 token 的特征表示) ---
-    y = linear(x, W_hidden)
+def softmax(logits):
+    mv = max(val.data for val in logits)
+    exps = [(val - mv).exp() for val in logits]
+    total = sum(exps, Value(0))
+    return [e / total for e in exps]
 
-    # --- Step 2: 学习 (将当前 token 存入权重) ---
-    # 定义目标：W 应该能够重建 x
+# ========== 3. Hybrid 层 (TTT & Attention) ==========
+def ttt_step(x, W_hidden, ttt_lr=0.2):
+    y = linear(x, W_hidden) # 这里的线性变换就是 RNN 式的状态提取
+    # 自监督更新：让 W 学会重建 x
     x_hat = linear(x, W_hidden)
-    ttt_loss = sum(((xh - xi)**2 for xh, xi in zip(x_hat, x)), Value(0))
-
-    # 局部反向传播，仅针对隐藏矩阵 W_hidden
-    ttt_loss.backward()
-
-    # 更新隐藏状态权重 (这就是 TTT 的“状态转移”)
+    loss = sum(((xh - xi)**2 for xh, xi in zip(x_hat, x)), Value(0))
+    loss.backward()
     for row in W_hidden:
         for p in row:
             p.data -= ttt_lr * p.grad
-            p.grad = 0 # 必须清空，否则下一时刻梯度会累加
-
+            p.grad = 0
     return y
 
-# ========== 5. 模型前向传播流程 (彻底无 KV Cache) ==========
+def attention_step(q, k_cache, v_cache):
+    d_k = len(q)
+    scores = [sum((qi * ki for qi, ki in zip(q, k)), Value(0)) / (d_k**0.5) for k in k_cache]
+    weights = softmax(scores)
+    return [sum((weights[t] * v_cache[t][j] for t in range(len(v_cache))), Value(0)) for j in range(d_k)]
 
-def model_forward(tokens, ttt_states):
-    """
-    tokens: token 列表
-    ttt_states: 每一层的权重矩阵列表 [n_layer, n_embd, n_embd]
-    """
-    logits_seq = []
-    for token_id in tokens:
-        x = state_dict['wte'][token_id]
+# ========== 4. 模型参数初始化 ==========
+random.seed(42)
+n_embd = 12
+vocab_size = 27 # a-z + BOS
+char_to_it = {ch: i for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz")}
+it_to_char = {i: ch for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz")}
+char_to_it['.'] = 26; it_to_char[26] = '.'
+BOS = 26
 
-        for i in range(n_layer):
-            # TTT 模块 (替代 Attention，无 KV Cache 增长)
-            x_res = x
-            x = rmsnorm(x)
-            x = ttt_layer_step(x, ttt_states[i])
-            x = [ai + bi for ai, bi in zip(x, x_res)]
+state_dict = {
+    'wte': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(vocab_size)],
+    'lm_head': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(vocab_size)],
+    'attn_q': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)],
+    'attn_k': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)],
+    'attn_v': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)],
+    'mlp': [[Value(random.gauss(0, 0.1)) for _ in range(n_embd)] for _ in range(n_embd)]
+}
 
-            # MLP 模块
-            x_res = x
-            x = rmsnorm(x)
-            x = linear([xi.relu() for xi in linear(x, state_dict[f'layer{i}.mlp'])],
-                       state_dict[f'layer{i}.mlp_out'])
-            x = [ai + bi for ai, bi in zip(x, x_res)]
+# ========== 5. 混合前向传播逻辑 ==========
+def forward(token_id, ttt_states, kv_cache):
+    x = state_dict['wte'][token_id]
 
-        logits = linear(x, state_dict['lm_head'])
-        logits_seq.append(logits)
+    # Layer 0: TTT (长程记忆矩阵)
+    x = [ai + bi for ai, bi in zip(ttt_step(rmsnorm(x), ttt_states[0]), x)]
 
-    return logits_seq
+    # Layer 1: Attention (短程查表)
+    x_norm = rmsnorm(x)
+    q = linear(x_norm, state_dict['attn_q'])
+    k = linear(x_norm, state_dict['attn_k'])
+    v = linear(x_norm, state_dict['attn_v'])
+    kv_cache['k'].append(k); kv_cache['v'].append(v)
+    x = [ai + bi for ai, bi in zip(attention_step(q, kv_cache['k'], kv_cache['v']), x)]
 
-# ========== 6. 训练循环 (Pre-training Backbone) ==========
+    # Layer 2: MLP
+    x = [ai + bi for ai, bi in zip(linear([xi.relu() for xi in linear(rmsnorm(x), state_dict['mlp'])], state_dict['mlp']), x)]
 
-print("=== 开始预训练 TTT-Backbone (学习通用语言规律) ===")
-for step in range(301):
-    doc = docs[step % len(docs)]
-    tokens = [char_to_it[c] for c in doc] + [BOS]
+    return linear(x, state_dict['lm_head'])
 
-    # 每个序列开始时，初始化 TTT 矩阵为单位阵 (表示初始记忆为空)
-    ttt_states = [[[Value(1.0 if i==j else 0.0) for j in range(n_embd)]
-                    for i in range(n_embd)] for _ in range(n_layer)]
+# ========== 6. 极速预训练 (过拟合几个单词以验证逻辑) ==========
+dataset = ["zack", "jack", "mary"]
+print("=== 开始 Hybrid 预训练 (微型过拟合测试) ===")
+for step in range(151):
+    word = random.choice(dataset)
+    tokens = [char_to_it[c] for c in word] + [BOS]
 
-    # 前向计算
-    logits_seq = model_forward(tokens[:-1], ttt_states)
+    ttt_states = [[[Value(1.0 if i==j else 0.0) for j in range(n_embd)] for i in range(n_embd)]]
+    kv_cache = {'k': [], 'v': []}
 
-    # 交叉熵损失
-    total_loss = Value(0)
-    for i, target in enumerate(tokens[1:]):
-        logits = logits_seq[i]
-        max_l = max(l.data for l in logits)
-        sum_exp = sum(((l - max_l).exp() for l in logits), Value(0))
-        loss = (sum_exp.log() + max_l) - logits[target]
-        total_loss = total_loss + loss
+    loss = Value(0)
+    for t in range(len(tokens)-1):
+        logits = forward(tokens[t], ttt_states, kv_cache)
+        probs = softmax(logits)
+        loss = loss + (-probs[tokens[t+1]].log())
 
-    avg_loss = total_loss / (len(tokens) - 1)
-    avg_loss.backward()
+    loss = loss / (len(tokens)-1)
+    loss.backward()
 
-    # 更新静态 Backbone 参数 (SGD)
-    for mat in state_dict.values():
-        for row in mat:
+    for key in state_dict:
+        for row in state_dict[key]:
             for p in row:
-                p.data -= learning_rate * p.grad
+                p.data -= 0.05 * p.grad
                 p.grad = 0
+    if step % 50 == 0: print(f"Step {step} | Loss: {loss.data:.4f}")
 
-    if step % 50 == 0:
-        print(f"Step {step:3d} | Loss: {avg_loss.data:.4f}")
+# ========== 7. 推理生成 ==========
+def generate(prefix):
+    ttt_states = [[[Value(1.0 if i==j else 0.0) for j in range(n_embd)] for i in range(n_embd)]]
+    kv_cache = {'k': [], 'v': []}
 
-# ========== 7. 最终推理生成 (完全无 KV 缓存模式) ==========
+    tokens = [char_to_it[c] for c in prefix]
+    for t in tokens[:-1]: forward(t, ttt_states, kv_cache)
 
-def generate(prefix_str, max_len=10):
-    # 1. 状态初始化 (State as Weights)
-    ttt_states = [[[Value(1.0 if i==j else 0.0) for j in range(n_embd)]
-                    for i in range(n_embd)] for _ in range(n_layer)]
-
-    # 2. 处理前缀并注入状态
-    tokens = [char_to_it[c] for c in prefix_str]
-    # 通过 model_forward 处理前缀，ttt_states 会在此过程中被实时“训练”
-    _ = model_forward(tokens, ttt_states)
-
-    result = prefix_str
-    curr_token = tokens[-1]
-
-    for _ in range(max_len):
-        # 核心：只输入当前 token，记忆全在 ttt_states 矩阵里
-        # 这就是线性递归 (Linear Recurrence) 的魅力
-        logits = model_forward([curr_token], ttt_states)[0]
-
-        # 贪婪采样
-        next_id = 0
-        mv = -1e10
-        for i, v in enumerate(logits):
-            if v.data > mv:
-                mv = v.data
-                next_id = i
-
+    res = prefix
+    curr = tokens[-1]
+    for _ in range(6):
+        logits = forward(curr, ttt_states, kv_cache)
+        next_id = max(range(vocab_size), key=lambda i: logits[i].data)
         if next_id == BOS: break
-        char = it_to_char[next_id]
-        result += char
-        curr_token = next_id
+        res += it_to_char[next_id]
+        curr = next_id
+    return res
 
-    return result
-
-print("\n=== TTT 推理测试 (无 KV Cache) ===")
-for p in ["ma", "li", "jo"]:
-    print(f"前缀 '{p}' -> 生成结果: '{generate(p)}'")
+print("\n=== 推理测试 ===")
+for p in ["za", "ma", "ja"]:
+    print(f"Prefix: '{p}' -> Result: '{generate(p)}'")
