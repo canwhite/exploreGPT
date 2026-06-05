@@ -221,6 +221,7 @@ def backward(self):
     # 1. 拓扑排序：确保从后往前计算
     topo = []
     visited = set()
+    # dfs加上所有节点
     def build_topo(v):
         if v not in visited:
             visited.add(v)
@@ -295,11 +296,7 @@ def relu(self):
 在开始数据处理之前，先理解模型的超参数设计。
 
 ```python
-n_layer = 1      # Transformer 层数
-n_embd = 16      # 嵌入维度
-block_size = 16  # 上下文窗口长度
-n_head = 4       # 注意力头数
-head_dim = 4     # 每个头的维度 (n_embd // n_head)
+l
 ```
 
 #### 核心概念
