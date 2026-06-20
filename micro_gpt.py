@@ -53,7 +53,7 @@ class Value:
     def exp(self):  # type: ignore[no-untyped-def]
         return Value(math.exp(self.data), (self,), (math.exp(self.data),))
 
-    def relu(self):  # type: ignore[no-untyped-def]
+    def relu(self) -> 'Value':  # type: ignore[no-untyped-def]
         return Value(max(0, self.data), (self,), (float(self.data > 0),))
 
     def __neg__(self):  # type: ignore[no-untyped-def]
@@ -118,7 +118,7 @@ print(f"num params: {len(params)}")
 
 # 定义模型架构：将tokens和参数映射到下一个token的logits
 # 参考GPT-2架构，做了一些微调：layernorm改为rmsnorm，无bias，GeLU改为ReLU
-def linear(x, w):
+def linear(x: list[Value], w: list[list[Value]]) -> list[Value]:
     """线性变换：y = xW^T"""
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
@@ -135,11 +135,11 @@ def rmsnorm(x):
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
 
-def gpt(token_id, pos_id, keys, values):
+def gpt(token_id: int, pos_id: int, keys: list[list[list[Value]]], values: list[list[list[Value]]]) -> list[Value]:
     """GPT模型前向传播：核心函数"""
     tok_emb = state_dict['wte'][token_id] # token嵌入：将token ID转换为向量
     pos_emb = state_dict['wpe'][pos_id] # 位置嵌入：编码位置信息
-    x = [t + p for t, p in zip(tok_emb, pos_emb)] # 结合token和位置信息
+    x: list[Value] = [t + p for t, p in zip(tok_emb, pos_emb)] # 结合token和位置信息
     x = rmsnorm(x) # 预归一化（注：由于残差连接的反向传播，这里不冗余）
 
     for li in range(n_layer):
@@ -192,7 +192,8 @@ for step in range(num_steps):
     n = min(block_size, len(tokens) - 1)
 
     # 前向传播：将token序列输入模型，构建计算图直到loss
-    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    keys: list[list[list[Value]]] = [[] for _ in range(n_layer)]
+    values: list[list[list[Value]]] = [[] for _ in range(n_layer)]
     losses: list['Value'] = []  # 显式声明类型
     for pos_id in range(n):
         token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
@@ -225,7 +226,8 @@ for step in range(num_steps):
 temperature = 0.5 # 温度参数 (0, 1]，控制生成文本的"创造性"，低=保守，高=创新
 print("\n--- inference (new, hallucinated names) ---")
 for sample_idx in range(20):
-    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    keys = [[] for _ in range(n_layer)]
+    values = [[] for _ in range(n_layer)]
     token_id = BOS  # 从BOS开始
     sample = []
     for pos_id in range(block_size):
