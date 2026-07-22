@@ -125,6 +125,7 @@ for i in range(n_layer):
     state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
     # MoE：router 决定 token 去哪个 expert；每个 expert 是独立的两层 ReLU MLP
     state_dict[f'layer{i}.router'] = matrix(n_expert, n_embd, std=router_std)
+    # 可以理解为各自的mlp
     for e in range(n_expert):
         state_dict[f'layer{i}.expert{e}.fc1'] = matrix(4 * n_embd, n_embd)  # 扩展 4 倍
         state_dict[f'layer{i}.expert{e}.fc2'] = matrix(n_embd, 4 * n_embd)  # 投影回原始维度
