@@ -168,8 +168,12 @@ def moe(x: list[Value], layer_index: int) -> list[Value]:
     3) 只对被选专家做两层 ReLU MLP；
     4) 用被选专家的 router 概率作为标量缩放输出，让 router 进入 loss 计算图。
     """
+    # router_logits = linear(x, state_dict[...]) 就是 “拿 token 表示去和每个专家的偏好向量做点积，
+    # 得出每个专家的原始得分”
+    # 后面 softmax 转概率、top1 选第一、概率缩放专家输出，全依赖这一步得到的 router_logits。
     router_logits = linear(x, state_dict[f'layer{layer_index}.router'])
     probs = softmax(router_logits)
+    #扫一遍概率，挑数值最大的位置，返回那个位置（专家索引）。
     expert_idx = top1(probs)
     selected_prob = probs[expert_idx]  # Value 节点，使 router 在反向传播中获梯度
     # 只为被选专家构造 Value 节点：未选专家不进入本次 loss 的计算图
