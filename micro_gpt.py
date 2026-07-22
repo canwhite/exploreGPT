@@ -30,59 +30,64 @@ print(f"vocab size: {vocab_size}")
 class Value:
     __slots__ = ('data', 'grad', '_children', '_local_grads') # Python内存优化
 
-    def __init__(self, data, children=(), local_grads=()):
-        self.data = data                # 前向传播时计算的标量值
-        self.grad = 0                   # 损失函数对该节点的梯度（导数），在反向传播中计算
+    def __init__(
+        self,
+        data: float | int,
+        children: tuple['Value', ...] = (),
+        local_grads: tuple[float | int, ...] = (),
+    ) -> None:
+        self.data = float(data)         # 前向传播时计算的标量值
+        self.grad = 0.0                 # 损失函数对该节点的梯度（导数），在反向传播中计算
         self._children = children       # 计算图中的子节点
         self._local_grads = local_grads # 该节点对子节点的局部导数
 
-    def __add__(self, other):  # type: ignore[no-untyped-def]
+    def __add__(self, other: 'Value | float | int') -> 'Value':
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data + other.data, (self, other), (1, 1))
 
-    def __mul__(self, other):  # type: ignore[no-untyped-def]
+    def __mul__(self, other: 'Value | float | int') -> 'Value':
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data * other.data, (self, other), (other.data, self.data))
 
-    def __pow__(self, other):  # type: ignore[no-untyped-def]
+    def __pow__(self, other: float | int) -> 'Value':
         return Value(self.data**other, (self,), (other * self.data**(other-1),))
 
-    def log(self):  # type: ignore[no-untyped-def]
+    def log(self) -> 'Value':
         return Value(math.log(self.data), (self,), (1/self.data,))
 
-    def exp(self):  # type: ignore[no-untyped-def]
+    def exp(self) -> 'Value':
         return Value(math.exp(self.data), (self,), (math.exp(self.data),))
 
-    def relu(self) -> 'Value':  # type: ignore[no-untyped-def]
+    def relu(self) -> 'Value':
         return Value(max(0, self.data), (self,), (float(self.data > 0),))
 
-    def __neg__(self):  # type: ignore[no-untyped-def]
+    def __neg__(self) -> 'Value':
         return self * -1
 
-    def __radd__(self, other):  # type: ignore[no-untyped-def]
+    def __radd__(self, other: float | int) -> 'Value':
         return self + other
 
-    def __sub__(self, other):  # type: ignore[no-untyped-def]
+    def __sub__(self, other: 'Value | float | int') -> 'Value':
         return self + (-other)
 
-    def __rsub__(self, other):  # type: ignore[no-untyped-def]
+    def __rsub__(self, other: float | int) -> 'Value':
         return other + (-self)
 
-    def __rmul__(self, other):  # type: ignore[no-untyped-def]
+    def __rmul__(self, other: float | int) -> 'Value':
         return self * other
 
-    def __truediv__(self, other):  # type: ignore[no-untyped-def]
+    def __truediv__(self, other: 'Value | float | int') -> 'Value':
         return self * other**-1
 
-    def __rtruediv__(self, other):  # type: ignore[no-untyped-def]
+    def __rtruediv__(self, other: float | int) -> 'Value':
         return other * self**-1
 
-    def backward(self):
+    def backward(self) -> None:
         """反向传播：计算所有参数的梯度"""
-        topo = []  # 拓扑排序：确保在计算梯度时，先计算依赖的节点
-        visited = set()
+        topo: list[Value] = []  # 拓扑排序：确保在计算梯度时，先计算依赖的节点
+        visited: set[Value] = set()
         #DFS添加所有节点
-        def build_topo(v):
+        def build_topo(v: Value) -> None:
             if v not in visited:
                 visited.add(v)
                 for child in v._children:
@@ -102,8 +107,14 @@ n_embd = 16     # 网络宽度（嵌入维度）
 block_size = 16 # 注意力窗口的最大上下文长度（注：最长名字是15个字符）
 n_head = 4      # 注意力头的数量
 head_dim = n_embd // n_head # 每个注意力头的维度
-matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+def matrix(nout: int, nin: int, std: float = 0.08) -> list[list[Value]]:
+    return [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
+
+state_dict: dict[str, list[list[Value]]] = {
+    'wte': matrix(vocab_size, n_embd),
+    'wpe': matrix(block_size, n_embd),
+    'lm_head': matrix(vocab_size, n_embd),
+}
 # wte: token嵌入矩阵, wpe: 位置嵌入矩阵, lm_head: 语言模型输出头
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)  # Query权重矩阵
@@ -120,18 +131,18 @@ print(f"num params: {len(params)}")
 # 参考GPT-2架构，做了一些微调：layernorm改为rmsnorm，无bias，GeLU改为ReLU
 def linear(x: list[Value], w: list[list[Value]]) -> list[Value]:
     """线性变换：y = xW^T"""
-    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+    return [sum((wi * xi for wi, xi in zip(wo, x)), Value(0)) for wo in w]
 
-def softmax(logits):
+def softmax(logits: list[Value]) -> list[Value]:
     """Softmax激活函数：将logits转换为概率分布"""
     max_val = max(val.data for val in logits)
     exps = [(val - max_val).exp() for val in logits]
-    total = sum(exps)
+    total = sum(exps, Value(0))
     return [e / total for e in exps]
 
-def rmsnorm(x):
+def rmsnorm(x: list[Value]) -> list[Value]:
     """RMS归一化：稳定训练，防止数值溢出"""
-    ms = sum(xi * xi for xi in x) / len(x)
+    ms = sum((xi * xi for xi in x), Value(0)) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
 
@@ -151,17 +162,17 @@ def gpt(token_id: int, pos_id: int, keys: list[list[list[Value]]], values: list[
         v = linear(x, state_dict[f'layer{li}.attn_wv'])  # Value：其他token的值
         keys[li].append(k)  # 缓存key，用于自注意力
         values[li].append(v)  # 缓存value
-        x_attn = []
+        x_attn: list[Value] = []
         for h in range(n_head):  # 遍历每个注意力头
             hs = h * head_dim
             q_h = q[hs:hs+head_dim]  # 当前头的query
             k_h = [ki[hs:hs+head_dim] for ki in keys[li]]  # 当前头的历史keys
             v_h = [vi[hs:hs+head_dim] for vi in values[li]]  # 当前头的历史values
             # 计算注意力分数：Q·K^T / sqrt(d_k)
-            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
+            attn_logits = [sum((q_h[j] * k_h[t][j] for j in range(head_dim)), Value(0)) / head_dim**0.5 for t in range(len(k_h))]
             attn_weights = softmax(attn_logits)  # 转换为概率分布
             # 加权求和：根据注意力权重聚合values
-            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
+            head_out = [sum((attn_weights[t] * v_h[t][j] for t in range(len(v_h))), Value(0)) for j in range(head_dim)]
             x_attn.extend(head_out)
 
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])  # 输出投影
